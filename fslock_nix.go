@@ -47,7 +47,7 @@ func (l *Lock) TryLock() error {
 }
 
 func (l *Lock) open() error {
-	fd, err := syscall.Open(l.filename, syscall.O_CREAT|syscall.O_RDWR, 0600)
+	fd, err := syscall.Open(l.filename, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC, 0600)
 	if err != nil {
 		return err
 	}
@@ -57,7 +57,13 @@ func (l *Lock) open() error {
 
 // Unlock unlocks the lock.
 func (l *Lock) Unlock() error {
-	return syscall.Close(l.fd)
+	if l.fd < 0 {
+		return nil
+	}
+	_ = syscall.Flock(l.fd, syscall.LOCK_UN)
+	err := syscall.Close(l.fd)
+	l.fd = -1
+	return err
 }
 
 // LockWithTimeout tries to lock the lock until the timeout expires.  If the

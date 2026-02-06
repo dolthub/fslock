@@ -4,6 +4,7 @@
 package fslock_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -216,6 +217,40 @@ func (s *fslockSuite) TestLockWithTimeout(c *gc.C) {
 	case <-time.After(shortWait * 2):
 		c.Fatalf("lock took too long to timeout")
 	}
+}
+
+func (s *fslockSuite) TestUnlockedWithContext(c *gc.C) {
+	lock := fslock.New(filepath.Join(c.MkDir(), "testing"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
+	defer cancel()
+	err := lock.LockWithContext(ctx)
+	c.Assert(err, gc.IsNil)
+	lock.Unlock()
+}
+
+func (s *fslockSuite) TestLockWithContextDeadlineExceeded(c *gc.C) {
+	path := filepath.Join(c.MkDir(), "testing")
+	lock := fslock.New(path)
+
+	kill := make(chan struct{})
+
+	// this will block until the other process has the lock.
+	procDone := LockFromAnotherProc(c, path, kill)
+
+	defer func() {
+		close(kill)
+		// now wait for the other process to exit so the file will be unlocked.
+		select {
+		case <-procDone:
+		case <-time.After(time.Second):
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
+	defer cancel()
+	err := lock.LockWithContext(ctx)
+	c.Assert(err, gc.Equals, context.DeadlineExceeded)
 }
 
 func (s *fslockSuite) TestStress(c *gc.C) {

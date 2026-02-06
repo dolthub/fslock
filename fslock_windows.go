@@ -4,6 +4,7 @@
 package fslock
 
 import (
+	"context"
 	"log"
 	"syscall"
 	"time"
@@ -117,6 +118,91 @@ func (l *Lock) LockWithTimeout(timeout time.Duration) (oerr error) {
 		return ErrTimeout
 	default:
 		return err
+	}
+}
+
+// LockWithContext tries to lock the lock until the context is canceled or its deadline is exceeded.
+// If the context is canceled before the lock is acquired, this method returns ctx.Err().
+func (l *Lock) LockWithContext(ctx context.Context) (oerr error) {
+	name, err := syscall.UTF16PtrFromString(l.filename)
+	if err != nil {
+		return err
+	}
+
+	// Open for asynchronous I/O so that we can periodically wake to check ctx.
+	// Also open shared so that other processes can open the file (but will
+	// still need to lock it).
+	handle, err := syscall.CreateFile(
+		name,
+		syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ,
+		nil,
+		syscall.OPEN_ALWAYS,
+		syscall.FILE_FLAG_OVERLAPPED|fileFlagNormal,
+		0)
+	if err != nil {
+		return err
+	}
+	l.handle = handle
+	defer func() {
+		if oerr != nil {
+			syscall.Close(handle)
+		}
+	}()
+
+	ol, err := newOverlapped()
+	if err != nil {
+		return err
+	}
+	defer syscall.CloseHandle(ol.HEvent)
+
+	err = lockFileEx(handle, lockfileExclusiveLock, 0, 1, 0, ol)
+	if err == nil {
+		return nil
+	}
+	// ERROR_IO_PENDING is expected when we're waiting on an asychronous event
+	// to occur.
+	if err != syscall.ERROR_IO_PENDING {
+		return err
+	}
+
+	const defaultPoll = 50 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		wait := defaultPoll
+		if dl, ok := ctx.Deadline(); ok {
+			remain := time.Until(dl)
+			if remain <= 0 {
+				return ctx.Err()
+			}
+			if remain < wait {
+				wait = remain
+			}
+		}
+
+		millis := uint32(wait.Nanoseconds() / 1000000)
+		if millis == 0 {
+			millis = 1
+		}
+
+		s, werr := syscall.WaitForSingleObject(ol.HEvent, millis)
+		switch s {
+		case syscall.WAIT_OBJECT_0:
+			return nil
+		case syscall.WAIT_TIMEOUT:
+			// loop and re-check ctx
+			continue
+		default:
+			if werr != nil {
+				return werr
+			}
+			return syscall.EINVAL
+		}
 	}
 }
 

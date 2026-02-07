@@ -35,7 +35,7 @@ type Lock struct {
 
 // New returns a new lock around the given file.
 func New(filename string) *Lock {
-	return &Lock{filename: filename}
+	return &Lock{filename: filename, handle: syscall.InvalidHandle}
 }
 
 // TryLock attempts to lock the lock.  This method will return ErrLocked
@@ -56,7 +56,12 @@ func (l *Lock) Lock() error {
 
 // Unlock unlocks the lock.
 func (l *Lock) Unlock() error {
-	return syscall.Close(l.handle)
+	if l.handle == syscall.InvalidHandle || l.handle == 0 {
+		return nil
+	}
+	h := l.handle
+	l.handle = syscall.InvalidHandle
+	return syscall.Close(h)
 }
 
 // LockWithTimeout tries to lock the lock until the timeout expires.  If the

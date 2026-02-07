@@ -1,0 +1,30 @@
+name: Go tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-race:
+    name: go test -race
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Test (race)
+        run: go test ./... -race

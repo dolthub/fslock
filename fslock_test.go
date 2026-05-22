@@ -15,26 +15,19 @@ import (
 	"testing"
 	"time"
 
-	gc "gopkg.in/check.v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/fslock"
 )
-
-func Test(t *testing.T) {
-	gc.TestingT(t)
-}
 
 const (
 	shortWait = 10 * time.Millisecond
 	longWait  = 10 * shortWait
 )
 
-type fslockSuite struct{}
-
-var _ = gc.Suite(&fslockSuite{})
-
-func (s *fslockSuite) TestLockNoContention(c *gc.C) {
-	path := filepath.Join(c.MkDir(), "testing")
+func TestLockNoContention(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testing")
 	lock := fslock.New(path)
 
 	started := make(chan struct{})
@@ -43,35 +36,35 @@ func (s *fslockSuite) TestLockNoContention(c *gc.C) {
 		close(started)
 		err := lock.Lock()
 		close(acquired)
-		c.Assert(err, gc.IsNil)
+		assert.NoError(t, err)
 	}()
 
 	select {
 	case <-started:
 		// good, goroutine started.
 	case <-time.After(shortWait * 2):
-		c.Fatalf("timeout waiting for goroutine to start")
+		t.Fatalf("timeout waiting for goroutine to start")
 	}
 
 	select {
 	case <-acquired:
 		// got the lock. good.
 	case <-time.After(shortWait * 2):
-		c.Fatalf("Timed out waiting for lock acquisition.")
+		t.Fatalf("Timed out waiting for lock acquisition.")
 	}
 
 	err := lock.Unlock()
-	c.Assert(err, gc.IsNil)
+	require.NoError(t, err)
 }
 
-func (s *fslockSuite) TestLockBlocks(c *gc.C) {
-	path := filepath.Join(c.MkDir(), "testing")
+func TestLockBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testing")
 	lock := fslock.New(path)
 
 	kill := make(chan struct{})
 
 	// this will block until the other process has the lock.
-	procDone := LockFromAnotherProc(c, path, kill)
+	procDone := LockFromAnotherProc(t, path, kill)
 
 	defer func() {
 		close(kill)
@@ -89,41 +82,41 @@ func (s *fslockSuite) TestLockBlocks(c *gc.C) {
 		err := lock.Lock()
 		close(acquired)
 		lock.Unlock()
-		c.Assert(err, gc.IsNil)
+		assert.NoError(t, err)
 	}()
 
 	select {
 	case <-started:
 		// good, goroutine started.
 	case <-time.After(shortWait * 2):
-		c.Fatalf("timeout waiting for goroutine to start")
+		t.Fatalf("timeout waiting for goroutine to start")
 	}
 
 	// Waiting for something not to happen is inherently hard...
 	select {
 	case <-acquired:
-		c.Fatalf("Unexpected lock acquisition")
+		t.Fatalf("Unexpected lock acquisition")
 	case <-time.After(shortWait * 2):
 		// all good.
 	}
 }
 
-func (s *fslockSuite) TestTryLock(c *gc.C) {
-	lock := fslock.New(filepath.Join(c.MkDir(), "testing"))
+func TestTryLock(t *testing.T) {
+	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
 
 	err := lock.TryLock()
-	c.Assert(err, gc.IsNil)
+	require.NoError(t, err)
 	lock.Unlock()
 }
 
-func (s *fslockSuite) TestTryLockNoBlock(c *gc.C) {
-	path := filepath.Join(c.MkDir(), "testing")
+func TestTryLockNoBlock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testing")
 	lock := fslock.New(path)
 
 	kill := make(chan struct{})
 
 	// this will block until the other process has the lock.
-	procDone := LockFromAnotherProc(c, path, kill)
+	procDone := LockFromAnotherProc(t, path, kill)
 
 	defer func() {
 		close(kill)
@@ -145,41 +138,36 @@ func (s *fslockSuite) TestTryLockNoBlock(c *gc.C) {
 	case <-started:
 		// good, goroutine started.
 	case <-time.After(shortWait):
-		c.Fatalf("timeout waiting for goroutine to start")
+		t.Fatalf("timeout waiting for goroutine to start")
 	}
 
 	// Wait for trylock to fail.
 	select {
 	case err := <-result:
-		// yes, I know this is redundant with the assert below, but it makes the
-		// failed test message clearer.
-		if err == nil {
-			c.Fatalf("lock succeeded, but should have errored out")
-		}
 		// This should be the error from trylock failing.
-		c.Assert(err, gc.Equals, fslock.ErrLocked)
+		require.ErrorIs(t, err, fslock.ErrLocked)
 	case <-time.After(shortWait):
-		c.Fatalf("took too long to fail trylock")
+		t.Fatalf("took too long to fail trylock")
 	}
 }
 
-func (s *fslockSuite) TestUnlockedWithTimeout(c *gc.C) {
-	lock := fslock.New(filepath.Join(c.MkDir(), "testing"))
+func TestUnlockedWithTimeout(t *testing.T) {
+	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
 
 	err := lock.LockWithTimeout(shortWait)
-	c.Assert(err, gc.IsNil)
+	require.NoError(t, err)
 	lock.Unlock()
 }
 
-func (s *fslockSuite) TestLockWithTimeout(c *gc.C) {
-	path := filepath.Join(c.MkDir(), "testing")
+func TestLockWithTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testing")
 	lock := fslock.New(path)
 	defer lock.Unlock()
 
 	kill := make(chan struct{})
 
 	// this will block until the other process has the lock.
-	procDone := LockFromAnotherProc(c, path, kill)
+	procDone := LockFromAnotherProc(t, path, kill)
 
 	defer func() {
 		close(kill)
@@ -201,42 +189,37 @@ func (s *fslockSuite) TestLockWithTimeout(c *gc.C) {
 	case <-started:
 		// good, goroutine started.
 	case <-time.After(shortWait * 2):
-		c.Fatalf("timeout waiting for goroutine to start")
+		t.Fatalf("timeout waiting for goroutine to start")
 	}
 
 	// Wait for timeout.
 	select {
 	case err := <-result:
-		// yes, I know this is redundant with the assert below, but it makes the
-		// failed test message clearer.
-		if err == nil {
-			c.Fatalf("lock succeeded, but should have timed out")
-		}
 		// This should be the error from the lock timing out.
-		c.Assert(err, gc.Equals, fslock.ErrTimeout)
+		require.ErrorIs(t, err, fslock.ErrTimeout)
 	case <-time.After(shortWait * 2):
-		c.Fatalf("lock took too long to timeout")
+		t.Fatalf("lock took too long to timeout")
 	}
 }
 
-func (s *fslockSuite) TestUnlockedWithContext(c *gc.C) {
-	lock := fslock.New(filepath.Join(c.MkDir(), "testing"))
+func TestUnlockedWithContext(t *testing.T) {
+	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
 	defer cancel()
 	err := lock.LockWithContext(ctx)
-	c.Assert(err, gc.IsNil)
+	require.NoError(t, err)
 	lock.Unlock()
 }
 
-func (s *fslockSuite) TestLockWithContextDeadlineExceeded(c *gc.C) {
-	path := filepath.Join(c.MkDir(), "testing")
+func TestLockWithContextDeadlineExceeded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testing")
 	lock := fslock.New(path)
 
 	kill := make(chan struct{})
 
 	// this will block until the other process has the lock.
-	procDone := LockFromAnotherProc(c, path, kill)
+	procDone := LockFromAnotherProc(t, path, kill)
 
 	defer func() {
 		close(kill)
@@ -250,10 +233,10 @@ func (s *fslockSuite) TestLockWithContextDeadlineExceeded(c *gc.C) {
 	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
 	defer cancel()
 	err := lock.LockWithContext(ctx)
-	c.Assert(err, gc.Equals, context.DeadlineExceeded)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func (s *fslockSuite) TestStress(c *gc.C) {
+func TestStress(t *testing.T) {
 	const lockAttempts = 200
 	const concurrentLocks = 10
 
@@ -264,16 +247,16 @@ func (s *fslockSuite) TestStress(c *gc.C) {
 
 	var wg sync.WaitGroup
 
-	dir := c.MkDir()
+	dir := t.TempDir()
 
-	var stress = func(name string) {
+	var stress = func() {
 		defer wg.Done()
 		lock := fslock.New(filepath.Join(dir, "testing"))
-		for i := 0; i < lockAttempts; i++ {
+		for range lockAttempts {
 			err := lock.Lock()
-			c.Assert(err, gc.IsNil)
+			assert.NoError(t, err)
 			state := atomic.AddInt32(lockState, 1)
-			c.Assert(state, gc.Equals, int32(1))
+			assert.Equal(t, int32(1), state)
 			// Tell the go routine scheduler to give a slice to someone else
 			// while we have this locked.
 			runtime.Gosched()
@@ -281,24 +264,24 @@ func (s *fslockSuite) TestStress(c *gc.C) {
 			// else grabbing the lock before we decrement the state.
 			atomic.AddInt32(lockState, -1)
 			err = lock.Unlock()
-			c.Assert(err, gc.IsNil)
+			assert.NoError(t, err)
 			// increment the general counter
 			atomic.AddInt64(counter, 1)
 		}
 	}
 
-	for i := 0; i < concurrentLocks; i++ {
+	for range concurrentLocks {
 		wg.Add(1)
-		go stress(fmt.Sprintf("Lock %d", i))
+		go stress()
 	}
 	wg.Wait()
-	c.Assert(*counter, gc.Equals, int64(lockAttempts*concurrentLocks))
+	require.Equal(t, int64(lockAttempts*concurrentLocks), *counter)
 }
 
 // LockFromAnotherProc will launch a process and block until that process has
 // created the lock file.  If we time out waiting for the other process to take
 // the lock, this function will fail the current test.
-func LockFromAnotherProc(c *gc.C, path string, kill chan struct{}) (done chan struct{}) {
+func LockFromAnotherProc(t *testing.T, path string, kill chan struct{}) (done chan struct{}) {
 	cmd := exec.Command(os.Args[0], "-test.run", "TestLockFromOtherProcess")
 	cmd.Env = append(
 		// We must preserve os.Environ() on Windows,
@@ -309,9 +292,8 @@ func LockFromAnotherProc(c *gc.C, path string, kill chan struct{}) (done chan st
 		"FSLOCK_TEST_HELPER_PATH="+path,
 	)
 
-	if err := cmd.Start(); err != nil {
-		c.Fatalf("error starting other proc: %v", err)
-	}
+	err := cmd.Start()
+	require.NoErrorf(t, err, "error starting other proc")
 
 	done = make(chan struct{})
 
@@ -329,14 +311,14 @@ func LockFromAnotherProc(c *gc.C, path string, kill chan struct{}) (done chan st
 		}
 	}()
 
-	for x := 0; x < 10; x++ {
+	for x := range 10 {
 		time.Sleep(shortWait)
 		if _, err := os.Stat(path); err == nil {
 			// file created by other process, let's continue
 			break
 		}
 		if x == 9 {
-			c.Fatalf("timed out waiting for other process to start")
+			t.Fatalf("timed out waiting for other process to start")
 		}
 	}
 	return done

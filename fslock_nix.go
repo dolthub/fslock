@@ -67,42 +67,58 @@ func (l *Lock) Unlock() error {
 	return err
 }
 
+// Maximum interval between non-blocking lock attempts in LockWithTimeout and
+// LockWithContext.
+const maxLockPoll = 32 * time.Millisecond
+
+// tryFlock makes a single non-blocking attempt to acquire the lock. It returns
+// (true, nil) if the lock was acquired, (false, nil) if it is currently held by
+// someone else (so the caller should wait and retry), and (false, err) on a
+// real error, in which case it has already closed and cleared the fd.
+//
+// flock cannot be canceled or given a deadline once it blocks, and closing the
+// fd does not unblock an in-flight blocking flock. So rather than parking a
+// goroutine in a blocking LOCK_EX (which leaks until the lock is released,
+// possibly forever), the timed/contextual waiters poll with LOCK_NB.
+func (l *Lock) tryFlock() (bool, error) {
+	for {
+		switch err := syscall.Flock(l.fd, syscall.LOCK_EX|syscall.LOCK_NB); err {
+		case nil:
+			return true, nil
+		case syscall.EINTR:
+			// Interrupted before the attempt resolved; retry immediately.
+			continue
+		case syscall.EWOULDBLOCK:
+			return false, nil
+		default:
+			syscall.Close(l.fd)
+			l.fd = -1
+			return false, err
+		}
+	}
+}
+
 // LockWithTimeout tries to lock the lock until the timeout expires.  If the
 // timeout expires, this method will return ErrTimeout.
 func (l *Lock) LockWithTimeout(timeout time.Duration) error {
 	if err := l.open(); err != nil {
 		return err
 	}
-	// Capture the fd locally. The goroutine below can outlive this call, so it
-	// must not touch l.fd, which a later Lock/Unlock is free to overwrite.
-	fd := l.fd
-	result := make(chan error)
-	cancel := make(chan struct{})
-	go func() {
-		err := syscall.Flock(fd, syscall.LOCK_EX)
-		select {
-		case <-cancel:
-			// The caller gave up; we own the fd now, so release and close it.
-			syscall.Flock(fd, syscall.LOCK_UN)
-			syscall.Close(fd)
-		case result <- err:
+	deadline := time.Now().Add(timeout)
+	backoff := time.Millisecond
+	for {
+		locked, err := l.tryFlock()
+		if locked || err != nil {
+			return err
 		}
-	}()
-	select {
-	case err := <-result:
-		if err != nil {
-			// Acquisition failed and the goroutine handed the fd back without
-			// closing it. Clean up and forget it.
-			syscall.Close(fd)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			syscall.Close(l.fd)
 			l.fd = -1
+			return ErrTimeout
 		}
-		return err
-	case <-time.After(timeout):
-		// Hand the fd to the goroutine, which closes it once Flock unblocks,
-		// and forget it here so a later Unlock doesn't touch it.
-		close(cancel)
-		l.fd = -1
-		return ErrTimeout
+		time.Sleep(min(backoff, remaining))
+		backoff = min(backoff*2, maxLockPoll)
 	}
 }
 
@@ -112,35 +128,21 @@ func (l *Lock) LockWithContext(ctx context.Context) error {
 	if err := l.open(); err != nil {
 		return err
 	}
-	// Capture the fd locally. The goroutine below can outlive this call, so it
-	// must not touch l.fd, which a later Lock/Unlock is free to overwrite.
-	fd := l.fd
-	result := make(chan error)
-	cancel := make(chan struct{})
-	go func() {
-		err := syscall.Flock(fd, syscall.LOCK_EX)
+	backoff := time.Millisecond
+	for {
+		locked, err := l.tryFlock()
+		if locked || err != nil {
+			return err
+		}
+		t := time.NewTimer(backoff)
 		select {
-		case <-cancel:
-			// The caller gave up; we own the fd now, so release and close it.
-			syscall.Flock(fd, syscall.LOCK_UN)
-			syscall.Close(fd)
-		case result <- err:
-		}
-	}()
-	select {
-	case err := <-result:
-		if err != nil {
-			// Acquisition failed and the goroutine handed the fd back without
-			// closing it. Clean up and forget it.
-			syscall.Close(fd)
+		case <-ctx.Done():
+			t.Stop()
+			syscall.Close(l.fd)
 			l.fd = -1
+			return ctx.Err()
+		case <-t.C:
 		}
-		return err
-	case <-ctx.Done():
-		// Hand the fd to the goroutine, which closes it once Flock unblocks,
-		// and forget it here so a later Unlock doesn't touch it.
-		close(cancel)
-		l.fd = -1
-		return ctx.Err()
+		backoff = min(backoff*2, maxLockPoll)
 	}
 }

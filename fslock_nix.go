@@ -73,23 +73,35 @@ func (l *Lock) LockWithTimeout(timeout time.Duration) error {
 	if err := l.open(); err != nil {
 		return err
 	}
+	// Capture the fd locally. The goroutine below can outlive this call, so it
+	// must not touch l.fd, which a later Lock/Unlock is free to overwrite.
+	fd := l.fd
 	result := make(chan error)
 	cancel := make(chan struct{})
 	go func() {
-		err := syscall.Flock(l.fd, syscall.LOCK_EX)
+		err := syscall.Flock(fd, syscall.LOCK_EX)
 		select {
 		case <-cancel:
-			// Timed out, cleanup if necessary.
-			syscall.Flock(l.fd, syscall.LOCK_UN)
-			syscall.Close(l.fd)
+			// The caller gave up; we own the fd now, so release and close it.
+			syscall.Flock(fd, syscall.LOCK_UN)
+			syscall.Close(fd)
 		case result <- err:
 		}
 	}()
 	select {
 	case err := <-result:
+		if err != nil {
+			// Acquisition failed and the goroutine handed the fd back without
+			// closing it. Clean up and forget it.
+			syscall.Close(fd)
+			l.fd = -1
+		}
 		return err
 	case <-time.After(timeout):
+		// Hand the fd to the goroutine, which closes it once Flock unblocks,
+		// and forget it here so a later Unlock doesn't touch it.
 		close(cancel)
+		l.fd = -1
 		return ErrTimeout
 	}
 }
@@ -100,23 +112,35 @@ func (l *Lock) LockWithContext(ctx context.Context) error {
 	if err := l.open(); err != nil {
 		return err
 	}
+	// Capture the fd locally. The goroutine below can outlive this call, so it
+	// must not touch l.fd, which a later Lock/Unlock is free to overwrite.
+	fd := l.fd
 	result := make(chan error)
 	cancel := make(chan struct{})
 	go func() {
-		err := syscall.Flock(l.fd, syscall.LOCK_EX)
+		err := syscall.Flock(fd, syscall.LOCK_EX)
 		select {
 		case <-cancel:
-			// Context canceled, cleanup if necessary.
-			syscall.Flock(l.fd, syscall.LOCK_UN)
-			syscall.Close(l.fd)
+			// The caller gave up; we own the fd now, so release and close it.
+			syscall.Flock(fd, syscall.LOCK_UN)
+			syscall.Close(fd)
 		case result <- err:
 		}
 	}()
 	select {
 	case err := <-result:
+		if err != nil {
+			// Acquisition failed and the goroutine handed the fd back without
+			// closing it. Clean up and forget it.
+			syscall.Close(fd)
+			l.fd = -1
+		}
 		return err
 	case <-ctx.Done():
+		// Hand the fd to the goroutine, which closes it once Flock unblocks,
+		// and forget it here so a later Unlock doesn't touch it.
 		close(cancel)
+		l.fd = -1
 		return ctx.Err()
 	}
 }

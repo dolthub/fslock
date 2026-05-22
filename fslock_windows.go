@@ -6,6 +6,7 @@ package fslock
 import (
 	"context"
 	"log"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -105,16 +106,31 @@ func (l *Lock) LockWithTimeout(timeout time.Duration) (oerr error) {
 	if err != windows.ERROR_IO_PENDING {
 		return err
 	}
-	s, err := windows.WaitForSingleObject(ol.HEvent, millis)
 
+	// The lock acquisition is now pending in the kernel, which retains a
+	// reference to ol until the operation completes. On any path that leaves it
+	// pending (timeout, error) we must cancel and drain it before our deferred
+	// CloseHandle(ol.HEvent) runs and before ol can be garbage collected.
+	lockPending := true
+	defer func() {
+		if lockPending {
+			drainPendingLock(handle, ol)
+		}
+	}()
+
+	s, werr := windows.WaitForSingleObject(ol.HEvent, millis)
 	switch s {
 	case windows.WAIT_OBJECT_0:
 		// success!
+		lockPending = false
 		return nil
 	case uint32(windows.WAIT_TIMEOUT):
 		return ErrTimeout
 	default:
-		return err
+		if werr != nil {
+			return werr
+		}
+		return windows.ERROR_INVALID_PARAMETER
 	}
 }
 
@@ -126,9 +142,9 @@ func (l *Lock) LockWithContext(ctx context.Context) (oerr error) {
 		return err
 	}
 
-	// Open for asynchronous I/O so that we can periodically wake to check ctx.
-	// Also open shared so that other processes can open the file (but will
-	// still need to lock it).
+	// Open for asynchronous I/O so that the lock can be issued without blocking
+	// and we can wait on it alongside context cancellation. Also open shared so
+	// that other processes can open the file (but will still need to lock it).
 	handle, err := windows.CreateFile(
 		name,
 		windows.GENERIC_READ,
@@ -166,43 +182,60 @@ func (l *Lock) LockWithContext(ctx context.Context) (oerr error) {
 		return err
 	}
 
-	const defaultPoll = 50 * time.Millisecond
-	for {
+	// The lock acquisition is now pending in the kernel, which retains a
+	// reference to ol until the operation completes. On any path that leaves it
+	// pending (cancellation, error) we must cancel and drain it before our
+	// deferred CloseHandle(ol.HEvent) runs and before ol can be garbage
+	// collected.
+	lockPending := true
+	defer func() {
+		if lockPending {
+			drainPendingLock(handle, ol)
+		}
+	}()
+
+	// Bridge context cancellation onto a waitable object: a goroutine signals
+	// cancelEvent when ctx is done, so we can block on the lock and the context
+	// simultaneously instead of polling.
+	cancelEvent, err := windows.CreateEvent(nil, 1 /* manualReset */, 0 /* initialState */, nil)
+	if err != nil {
+		return err
+	}
+	stop := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
+			windows.SetEvent(cancelEvent)
+		case <-stop:
 		}
+	}()
+	// Tear the watcher down (and wait for it to exit) before closing
+	// cancelEvent, so the goroutine can never SetEvent a closed -- and possibly
+	// recycled -- handle.
+	defer func() {
+		close(stop)
+		<-watcherDone
+		windows.CloseHandle(cancelEvent)
+	}()
 
-		wait := defaultPoll
-		if dl, ok := ctx.Deadline(); ok {
-			remain := time.Until(dl)
-			if remain <= 0 {
-				return ctx.Err()
-			}
-			if remain < wait {
-				wait = remain
-			}
+	// WaitForMultipleObjects returns WAIT_OBJECT_0 + i for the lowest index i
+	// that is signaled, so the lock (index 0) wins a simultaneous race.
+	s, werr := windows.WaitForMultipleObjects([]windows.Handle{ol.HEvent, cancelEvent}, false, windows.INFINITE)
+	switch s {
+	case windows.WAIT_OBJECT_0:
+		// The lock was acquired; leave the kernel's reference to ol settled.
+		lockPending = false
+		return nil
+	case windows.WAIT_OBJECT_0 + 1:
+		// Context was canceled; the deferred drain aborts the pending lock.
+		return ctx.Err()
+	default:
+		if werr != nil {
+			return werr
 		}
-
-		millis := uint32(wait.Nanoseconds() / 1000000)
-		if millis == 0 {
-			millis = 1
-		}
-
-		s, werr := windows.WaitForSingleObject(ol.HEvent, millis)
-		switch s {
-		case windows.WAIT_OBJECT_0:
-			return nil
-		case uint32(windows.WAIT_TIMEOUT):
-			// loop and re-check ctx
-			continue
-		default:
-			if werr != nil {
-				return werr
-			}
-			return windows.ERROR_INVALID_PARAMETER
-		}
+		return windows.ERROR_INVALID_PARAMETER
 	}
 }
 
@@ -214,4 +247,19 @@ func newOverlapped() (*windows.Overlapped, error) {
 		return nil, err
 	}
 	return &windows.Overlapped{HEvent: event}, nil
+}
+
+// drainPendingLock cancels a still-pending asynchronous LockFileEx and blocks
+// until the kernel has finished with the OVERLAPPED structure. After it
+// returns, the caller may safely close ol.HEvent / the file handle and let ol
+// be collected. It must be called while both handle and ol.HEvent are still
+// open.
+func drainPendingLock(handle windows.Handle, ol *windows.Overlapped) {
+	// CancelIoEx may report ERROR_NOT_FOUND if the op already completed; in that
+	// case GetOverlappedResult simply returns its result. Either way the lock is
+	// released when the caller closes the file handle.
+	windows.CancelIoEx(handle, ol)
+	var n uint32
+	windows.GetOverlappedResult(handle, ol, &n, true /* wait */)
+	runtime.KeepAlive(ol)
 }

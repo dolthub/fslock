@@ -26,7 +26,8 @@ const shortWait = 10 * time.Millisecond
 
 func TestLockNoContention(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
-	lock := fslock.New(path)
+	lock, err := fslock.New(path)
+	require.NoError(t, err)
 
 	started := make(chan struct{})
 	acquired := make(chan struct{})
@@ -51,13 +52,83 @@ func TestLockNoContention(t *testing.T) {
 		t.Fatalf("Timed out waiting for lock acquisition.")
 	}
 
-	err := lock.Unlock()
+	err = lock.Unlock()
 	require.NoError(t, err)
+}
+
+func TestNewInRoot(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer root.Close()
+
+	lock, err := fslock.NewInRoot(root, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+}
+
+// TestNewInRootDecoupledFromCallerRoot verifies that the lock opens its own
+// handle and keeps working after the caller closes the root they supplied.
+func TestNewInRootDecoupledFromCallerRoot(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+
+	lock, err := fslock.NewInRoot(root, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	// The lock must not depend on the caller's root staying open.
+	require.NoError(t, root.Close())
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+}
+
+// TestNewInRootSubRoot exercises the intended way to lock a file in a
+// subdirectory: hand NewInRoot a sub-root rather than a multi-component name.
+func TestNewInRootSubRoot(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	require.NoError(t, root.Mkdir("sub", 0700))
+	sub, err := root.OpenRoot("sub")
+	require.NoError(t, err)
+	defer sub.Close()
+
+	lock, err := fslock.NewInRoot(sub, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+
+	// The lock file should have been created within the subdirectory.
+	_, err = os.Stat(filepath.Join(dir, "sub", "testing"))
+	require.NoError(t, err)
+}
+
+func TestNewInRootInvalidName(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer root.Close()
+
+	for _, name := range []string{"", ".", "..", "a/b", "a\\b", "/abs", "sub/lock"} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			lock, err := fslock.NewInRoot(root, name)
+			require.ErrorIs(t, err, fslock.ErrInvalidName)
+			require.Nil(t, lock)
+		})
+	}
 }
 
 func TestLockBlocks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
-	lock := fslock.New(path)
+	lock, err := fslock.New(path)
+	require.NoError(t, err)
 
 	kill := make(chan struct{})
 
@@ -97,16 +168,18 @@ func TestLockBlocks(t *testing.T) {
 }
 
 func TestTryLock(t *testing.T) {
-	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	lock, err := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	require.NoError(t, err)
 
-	err := lock.TryLock()
+	err = lock.TryLock()
 	require.NoError(t, err)
 	lock.Unlock()
 }
 
 func TestTryLockNoBlock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
-	lock := fslock.New(path)
+	lock, err := fslock.New(path)
+	require.NoError(t, err)
 
 	kill := make(chan struct{})
 
@@ -144,16 +217,18 @@ func TestTryLockNoBlock(t *testing.T) {
 }
 
 func TestUnlockedWithTimeout(t *testing.T) {
-	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	lock, err := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	require.NoError(t, err)
 
-	err := lock.LockWithTimeout(shortWait)
+	err = lock.LockWithTimeout(shortWait)
 	require.NoError(t, err)
 	lock.Unlock()
 }
 
 func TestLockWithTimeout(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
-	lock := fslock.New(path)
+	lock, err := fslock.New(path)
+	require.NoError(t, err)
 	defer lock.Unlock()
 
 	kill := make(chan struct{})
@@ -192,18 +267,20 @@ func TestLockWithTimeout(t *testing.T) {
 }
 
 func TestUnlockedWithContext(t *testing.T) {
-	lock := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	lock, err := fslock.New(filepath.Join(t.TempDir(), "testing"))
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
 	defer cancel()
-	err := lock.LockWithContext(ctx)
+	err = lock.LockWithContext(ctx)
 	require.NoError(t, err)
 	lock.Unlock()
 }
 
 func TestLockWithContextDeadlineExceeded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
-	lock := fslock.New(path)
+	lock, err := fslock.New(path)
+	require.NoError(t, err)
 
 	kill := make(chan struct{})
 
@@ -218,7 +295,7 @@ func TestLockWithContextDeadlineExceeded(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortWait)
 	defer cancel()
-	err := lock.LockWithContext(ctx)
+	err = lock.LockWithContext(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
@@ -237,9 +314,10 @@ func TestStress(t *testing.T) {
 
 	var stress = func() {
 		defer wg.Done()
-		lock := fslock.New(filepath.Join(dir, "testing"))
+		lock, err := fslock.New(filepath.Join(dir, "testing"))
+		assert.NoError(t, err)
 		for range lockAttempts {
-			err := lock.Lock()
+			err = lock.Lock()
 			assert.NoError(t, err)
 			state := atomic.AddInt32(lockState, 1)
 			assert.Equal(t, int32(1), state)
@@ -369,8 +447,9 @@ func TestLockFromOtherProcess(t *testing.T) {
 		return
 	}
 	filename := os.Getenv("FSLOCK_TEST_HELPER_PATH")
-	lock := fslock.New(filename)
-	err := lock.Lock()
+	lock, err := fslock.New(filename)
+	require.NoError(t, err)
+	err = lock.Lock()
 	require.NoError(t, err)
 
 	// Signal the parent that the lock is now held.

@@ -1,10 +1,10 @@
 module github.com/dolthub/fslock
 
-go 1.22
+go 1.24.0
 
 require (
 	github.com/stretchr/testify v1.10.0
-	golang.org/x/sys v0.30.0
+	golang.org/x/sys v0.41.0
 )
 
 require (

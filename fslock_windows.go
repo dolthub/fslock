@@ -5,27 +5,51 @@ package fslock
 
 import (
 	"context"
-	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-func init() {
-	log.SetFlags(log.Lmicroseconds | log.Ldate)
-}
-
 // Lock implements cross-process locks using syscalls.
 // This implementation is based on LockFileEx syscall.
 type Lock struct {
-	filename string
-	handle   windows.Handle
+	// dir is a handle to the directory containing the lock file. It is used
+	// as the RootDirectory for NtCreateFile, so the lock file is resolved
+	// relative to it rather than by an absolute path and cannot escape it.
+	dir *os.File
+	// name is the base name of the lock file within dir.
+	name string
+	// handle is the open lock file while the lock is held; InvalidHandle
+	// otherwise.
+	handle windows.Handle
 }
 
-// New returns a new lock around the given file.
-func New(filename string) *Lock {
-	return &Lock{filename: filename, handle: windows.InvalidHandle}
+// New returns a new lock around the given file. It opens a handle to the
+// file's parent directory and returns an error if that directory cannot be
+// opened.
+func New(filename string) (*Lock, error) {
+	root, err := os.OpenRoot(filepath.Dir(filename))
+	if err != nil {
+		return nil, err
+	}
+	// Take an independent handle to the directory itself; it remains valid
+	// after the root is closed and serves as the RootDirectory below.
+	dir, err := root.Open(".")
+	root.Close()
+	if err != nil {
+		return nil, err
+	}
+	return &Lock{dir: dir, name: filepath.Base(filename), handle: windows.InvalidHandle}, nil
+}
+
+// Close releases the directory handle held by the lock. It does not release a
+// held lock; call Unlock first. The lock must not be used after Close.
+func (l *Lock) Close() error {
+	return l.dir.Close()
 }
 
 // TryLock attempts to lock the lock.  This method will return ErrLocked
@@ -54,25 +78,49 @@ func (l *Lock) Unlock() error {
 	return windows.Close(h)
 }
 
+// open creates (if necessary) and opens the lock file relative to the
+// directory handle. It opens for asynchronous I/O so that LockFileEx below can
+// wait with a timeout, and shared so that other processes can open the file
+// (but will still need to lock it).
+func (l *Lock) open() (windows.Handle, error) {
+	name, err := windows.NewNTUnicodeString(l.name)
+	if err != nil {
+		return 0, err
+	}
+	oa := &windows.OBJECT_ATTRIBUTES{
+		RootDirectory: windows.Handle(l.dir.Fd()),
+		ObjectName:    name,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE,
+	}
+	oa.Length = uint32(unsafe.Sizeof(*oa))
+
+	var iosb windows.IO_STATUS_BLOCK
+	var handle windows.Handle
+	err = windows.NtCreateFile(
+		&handle,
+		windows.GENERIC_READ,
+		oa,
+		&iosb,
+		nil, // AllocationSize
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_SHARE_READ,
+		windows.FILE_OPEN_IF, // create if absent, open if present (OPEN_ALWAYS)
+		// FILE_NON_DIRECTORY_FILE without any FILE_SYNCHRONOUS_IO_* option
+		// leaves the handle open for overlapped (asynchronous) I/O.
+		windows.FILE_NON_DIRECTORY_FILE,
+		0, // EaBuffer
+		0, // EaLength
+	)
+	if err != nil {
+		return 0, err
+	}
+	return handle, nil
+}
+
 // LockWithTimeout tries to lock the lock until the timeout expires.  If the
 // timeout expires, this method will return ErrTimeout.
 func (l *Lock) LockWithTimeout(timeout time.Duration) (oerr error) {
-	name, err := windows.UTF16PtrFromString(l.filename)
-	if err != nil {
-		return err
-	}
-
-	// Open for asynchronous I/O so that we can timeout waiting for the lock.
-	// Also open shared so that other processes can open the file (but will
-	// still need to lock it).
-	handle, err := windows.CreateFile(
-		name,
-		windows.GENERIC_READ,
-		windows.FILE_SHARE_READ,
-		nil,
-		windows.OPEN_ALWAYS,
-		windows.FILE_FLAG_OVERLAPPED|windows.FILE_ATTRIBUTE_NORMAL,
-		0)
+	handle, err := l.open()
 	if err != nil {
 		return err
 	}
@@ -137,22 +185,7 @@ func (l *Lock) LockWithTimeout(timeout time.Duration) (oerr error) {
 // LockWithContext tries to lock the lock until the context is canceled or its deadline is exceeded.
 // If the context is canceled before the lock is acquired, this method returns ctx.Err().
 func (l *Lock) LockWithContext(ctx context.Context) (oerr error) {
-	name, err := windows.UTF16PtrFromString(l.filename)
-	if err != nil {
-		return err
-	}
-
-	// Open for asynchronous I/O so that the lock can be issued without blocking
-	// and we can wait on it alongside context cancellation. Also open shared so
-	// that other processes can open the file (but will still need to lock it).
-	handle, err := windows.CreateFile(
-		name,
-		windows.GENERIC_READ,
-		windows.FILE_SHARE_READ,
-		nil,
-		windows.OPEN_ALWAYS,
-		windows.FILE_FLAG_OVERLAPPED|windows.FILE_ATTRIBUTE_NORMAL,
-		0)
+	handle, err := l.open()
 	if err != nil {
 		return err
 	}

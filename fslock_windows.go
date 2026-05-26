@@ -36,14 +36,35 @@ func New(filename string) (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Take an independent handle to the directory itself; it remains valid
-	// after the root is closed and serves as the RootDirectory below.
+	// NewInRoot opens its own handle to the directory, so the temporary root
+	// we opened here can be released as soon as it returns.
+	defer root.Close()
+	return NewInRoot(root, filepath.Base(filename))
+}
+
+// NewInRoot returns a new lock around the file named name within root. name
+// must be a single path component: it may not be empty, ".", "..", or contain a
+// path separator, and otherwise NewInRoot returns ErrInvalidName. To lock a file
+// in a subdirectory, pass a sub-root obtained from root.OpenRoot. The lock file
+// is resolved relative to a directory handle, so it can never escape root via
+// symlinks or "..".
+//
+// The lock borrows root only for the duration of this call: it opens its own
+// independent handle to root's directory, which it owns and which Close
+// releases. The caller retains ownership of root and may close it independently
+// of the returned Lock.
+func NewInRoot(root *os.Root, name string) (*Lock, error) {
+	if !validLockName(name) {
+		return nil, ErrInvalidName
+	}
+	// Take an independent handle to the directory itself, owned by the Lock; it
+	// remains valid after the caller closes their root and serves as the
+	// RootDirectory in open below.
 	dir, err := root.Open(".")
-	root.Close()
 	if err != nil {
 		return nil, err
 	}
-	return &Lock{dir: dir, name: filepath.Base(filename), handle: windows.InvalidHandle}, nil
+	return &Lock{dir: dir, name: name, handle: windows.InvalidHandle}, nil
 }
 
 // Close releases the directory handle held by the lock. It does not release a

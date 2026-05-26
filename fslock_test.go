@@ -56,6 +56,75 @@ func TestLockNoContention(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestNewInRoot(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer root.Close()
+
+	lock, err := fslock.NewInRoot(root, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+}
+
+// TestNewInRootDecoupledFromCallerRoot verifies that the lock opens its own
+// handle and keeps working after the caller closes the root they supplied.
+func TestNewInRootDecoupledFromCallerRoot(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+
+	lock, err := fslock.NewInRoot(root, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	// The lock must not depend on the caller's root staying open.
+	require.NoError(t, root.Close())
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+}
+
+// TestNewInRootSubRoot exercises the intended way to lock a file in a
+// subdirectory: hand NewInRoot a sub-root rather than a multi-component name.
+func TestNewInRootSubRoot(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	require.NoError(t, root.Mkdir("sub", 0700))
+	sub, err := root.OpenRoot("sub")
+	require.NoError(t, err)
+	defer sub.Close()
+
+	lock, err := fslock.NewInRoot(sub, "testing")
+	require.NoError(t, err)
+	defer lock.Close()
+
+	require.NoError(t, lock.Lock())
+	require.NoError(t, lock.Unlock())
+
+	// The lock file should have been created within the subdirectory.
+	_, err = os.Stat(filepath.Join(dir, "sub", "testing"))
+	require.NoError(t, err)
+}
+
+func TestNewInRootInvalidName(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer root.Close()
+
+	for _, name := range []string{"", ".", "..", "a/b", "a\\b", "/abs", "sub/lock"} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			lock, err := fslock.NewInRoot(root, name)
+			require.ErrorIs(t, err, fslock.ErrInvalidName)
+			require.Nil(t, lock)
+		})
+	}
+}
+
 func TestLockBlocks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "testing")
 	lock, err := fslock.New(path)

@@ -19,6 +19,13 @@ or the deadline or cancellation fires.
 
 ## Variables
 ``` go
+var ErrInvalidName error = errors.New("fslock: lock name must be a single path component")
+```
+ErrInvalidName indicates that the name passed to NewInRoot was not a single path
+component within the root: it was empty, ".", "..", or contained a path
+separator.
+
+``` go
 var ErrLocked error = trylockError("fslock is already locked")
 ```
 ErrLocked indicates TryLock failed because the lock was already locked.
@@ -44,6 +51,22 @@ func New(filename string) (*Lock, error)
 ```
 New returns a new lock around the given file. It opens a handle to the file's
 parent directory and returns an error if that directory cannot be opened.
+
+### func NewInRoot
+``` go
+func NewInRoot(root *os.Root, name string) (*Lock, error)
+```
+NewInRoot returns a new lock around the file named name within root. name must
+be a single path component: it may not be empty, ".", "..", or contain a path
+separator, and otherwise NewInRoot returns ErrInvalidName. To lock a file in a
+subdirectory, pass a sub-root obtained from root.OpenRoot. The lock file is
+resolved relative to a directory handle, so it can never escape root via
+symlinks or "..".
+
+The lock borrows root only for the duration of this call: it opens its own
+independent handle to root's directory, which it owns and which Close releases.
+The caller retains ownership of root and may close it independently of the
+returned Lock.
 
 ### func (\*Lock) Close
 ``` go
